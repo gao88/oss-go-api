@@ -43,6 +43,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -252,12 +253,35 @@ func (c *Client) signHeader(req *http.Request, canonicalizedResource string) {
 	req.Header.Set("Authorization", authorizationStr)
 }
 
-func (c *Client) doRequest(method, path, canonicalizedResource string, params map[string]string, data io.Reader) (resp *http.Response, err error) {
-	reqUrl := "http://" + c.Host + path
-	req, _ := http.NewRequest(method, reqUrl, data)
+func (c *Client) signURL(method string, contentMd5 string, contentType string, expires int64, canonicalizedOSSHeaders string, canonicalizedResource string) string {
+	signStr := fmt.Sprintf("%s\n%s\n%s\n%d\n%s%s", method, contentMd5, contentType, expires, canonicalizedOSSHeaders, canonicalizedResource)
+
+	h := hmac.New(func() hash.Hash { return sha1.New() }, []byte(c.AccessKey)) //sha1.New()
+	io.WriteString(h, signStr)
+	signedStr := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+	signedStr = url.QueryEscape(signedStr)
+
+	return signedStr
+}
+
+func (c *Client) doRequest(method, path, canonicalizedResource string, params map[string]string, data io.Reader, bname ...string) (resp *http.Response, err error) {
+	var host string
+
+	if len(bname) > 0 {
+		host += bname[0] + "." + c.Host
+	} else {
+		host = c.Host
+	}
+
+	expires := time.Now().Unix() + 3600
+	reqURL := fmt.Sprintf("http://%s%s&Expires=%d", host, path, expires)
+	reqURL += "&Signature=" + c.signURL(method, params["Content-Md5"], params["Content-Type"], expires, "", canonicalizedResource)
+
+	req, _ := http.NewRequest(method, reqURL, data)
 	date := time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
 	req.Header.Set("Date", date)
-	req.Header.Set("Host", c.Host)
+	req.Header.Set("Host", host)
 
 	if params != nil {
 		for k, v := range params {
@@ -268,8 +292,15 @@ func (c *Client) doRequest(method, path, canonicalizedResource string, params ma
 	if data != nil {
 		req.Header.Set("Content-Length", strconv.Itoa(int(req.ContentLength)))
 	}
-	c.signHeader(req, canonicalizedResource)
+
+	if strings.ToLower(method) != "get" {
+		c.signHeader(req, canonicalizedResource)
+	}
+
+	//fmt.Printf("req: %+v\n", req)
+
 	resp, err = c.HttpClient.Do(req)
+
 	return
 }
 
@@ -330,8 +361,13 @@ func (c *Client) PutBucketACL(bname, acl string) (err error) {
 
 //Get bucket's object list.
 func (c *Client) GetBucket(bname, prefix, marker, delimiter, maxkeys string) (lbr ListBucketResult, err error) {
-	reqStr := "/" + bname
-	resStr := reqStr
+	reqStr := fmt.Sprintf("/?OSSAccessKeyId=%s", c.AccessID)
+	resStr := "/"
+
+	if len(bname) > 0 {
+		resStr += bname + "/"
+	}
+
 	query := map[string]string{}
 	if prefix != "" {
 		query["prefix"] = prefix
@@ -350,13 +386,14 @@ func (c *Client) GetBucket(bname, prefix, marker, delimiter, maxkeys string) (lb
 	}
 
 	if len(query) > 0 {
-		reqStr += "?"
+		reqStr += "&"
 		for k, v := range query {
 			reqStr += k + "=" + v + "&"
 		}
+		reqStr = reqStr[:len(reqStr)-1]
 	}
 
-	resp, err := c.doRequest("GET", reqStr, resStr, nil, nil)
+	resp, err := c.doRequest("GET", reqStr, resStr, nil, nil, bname)
 	if err != nil {
 		return
 	}
